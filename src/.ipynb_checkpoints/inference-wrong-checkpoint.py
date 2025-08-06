@@ -1,13 +1,12 @@
-## Inference.py for Paligemma (Modified for Batch Inference)
-
 from PIL import Image
 import torch
 import fire
 from typing import List, Optional, Tuple
 
 from processing_paligemma import PaliGemmaProcessor
-from gemma_swa import KVCache, PaliGemmaForConditionalGeneration
 from utils import load_hf_model 
+
+
 from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler, schedule
 
 
@@ -68,7 +67,7 @@ def _sample_top_p(probs: torch.Tensor, p: float):
 
 
 def test_batch_inference(
-    model: PaliGemmaForConditionalGeneration,
+    model,
     processor: PaliGemmaProcessor,
     device: str,
     prompts: List[str],
@@ -77,6 +76,7 @@ def test_batch_inference(
     temperature: float,
     top_p: float,
     do_sample: bool,
+    kv_cache_class, 
 ):
     model_inputs = get_model_inputs(processor, prompts, image_file_paths, device)
     input_ids = model_inputs["input_ids"]
@@ -84,7 +84,9 @@ def test_batch_inference(
     pixel_values = model_inputs["pixel_values"]
 
     batch_size = input_ids.shape[0]
-    kv_cache = KVCache()
+    
+    # Instantiate the kv_cache using the class that was passed
+    kv_cache = kv_cache_class()
 
     stop_token = processor.tokenizer.eos_token_id
     generated_tokens_batch: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
@@ -115,25 +117,8 @@ def test_batch_inference(
             if not active_sequences.any():
                 break
 
-            # Only consider active sequences for the current forward pass
-            # We need to filter inputs for the current active sequences only
-            current_input_ids = input_ids[active_sequences]
-            current_attention_mask = attention_mask[active_sequences]
-            current_pixel_values=pixel_values
-            #current_pixel_values = pixel_values[active_sequences] if i == 0 else None # Vision model only processes once
-
-            # When processing in batches, ensure the KV cache is updated for the full batch,
-            # even if some sequences are inactive. The model's internal attention mechanism
-            # (especially with padding) will handle inactive sequences appropriately.
-            # The kv_cache stores for all sequences initially.
-            
-            # The model's forward pass expects full batch, so we need to pass full input_ids and attention_mask
-            # and then handle the logits and next_token based on active_sequences.
-            # The KV cache update should also happen for all sequences.
-
             outputs = model(
-                input_ids=input_ids, # Pass full input_ids (will contain generated tokens for active, EOS for inactive)
-                #pixel_values=pixel_values if i == 0 else None, # Pass original pixel_values only for the first step
+                input_ids=input_ids,
                 pixel_values=pixel_values,
                 attention_mask=attention_mask,
                 kv_cache=kv_cache,
@@ -201,53 +186,60 @@ def test_batch_inference(
         print("-" * 30)
     print("-----------------------------------------------------------------------\n")
 
-
 def main(
     model_path: str = None,
-    prompts: str = None,  # Expecting a comma-separated string for multiple prompts
-    image_file_paths: str = None,  # Expecting a comma-separated string for multiple image paths
+    prompts: str = None,
+    image_file_paths: str = None,
     max_tokens_to_generate: int = 100,
     temperature: float = 0.8,
     top_p: float = 0.9,
     do_sample: bool = False,
     only_cpu: bool = False,
+    attention_type: str = "GLOBAL",
 ):
+    """
+    Main function to run batch inference on a PaliGemma model.
+    """
+    # Dynamic imports now return the classes directly
+    if attention_type.upper() == "SWA":
+        from gemma_swa import KVCache, PaliGemmaForConditionalGeneration,PaliGemmaConfig
+        print("Using Sliding Window Attention (SWA) model.")
+    elif attention_type.upper() == "GLOBAL":
+        from gemma_global import KVCache, PaliGemmaForConditionalGeneration,PaliGemmaConfig
+        print("Using Global Attention model.")
+    else:
+        raise ValueError(f"Invalid attention_type: {attention_type}. Must be 'SWA' or 'GLOBAL'.")
+
     device = "cpu"
     if not only_cpu:
         if torch.cuda.is_available():
             device = "cuda"
         elif torch.backends.mps.is_available():
             device = "mps"
-
+    
     print("Device in use: ", device)
-
+    
     print(f"Loading model from {model_path}")
-    model, tokenizer = load_hf_model(model_path, device)
+    model, tokenizer = load_hf_model(model_path, device, PaliGemmaForConditionalGeneration, PaliGemmaConfig)
     model = model.to(device).eval()
 
     if device == "cuda":
-        # Using bfloat16 and torch.compile for performance on CUDA-enabled GPUs
         model = model.to(torch.bfloat16)
-        # apply_fake_sparsity(model) # This prunes weights to 2:4 pattern (makes values zero)
-        # apply_sparse_semistructured(model)
-        
         model = torch.compile(model)
-
+    
     num_image_tokens = model.config.vision_config.num_image_tokens
     image_size = model.config.vision_config.image_size
     processor = PaliGemmaProcessor(tokenizer, num_image_tokens, image_size)
-
-    # Convert comma-separated strings to lists
+    
     prompts_list = [p.strip() for p in prompts.split(',') if p.strip()] if prompts else []
     image_file_paths_list = [f.strip() for f in image_file_paths.split(',') if f.strip()] if image_file_paths else []
-
-    # Ensure number of prompts matches number of images
+    
     if len(prompts_list) != len(image_file_paths_list):
         raise ValueError("Number of prompts must match number of image file paths for batch inference.")
     if not prompts_list:
         print("No prompts or image paths provided. Exiting.")
         return
-
+        
     print(f"Running batch inference for {len(prompts_list)} samples")
     with torch.no_grad():
         test_batch_inference(
@@ -260,23 +252,10 @@ def main(
             temperature,
             top_p,
             do_sample,
+            kv_cache_class=KVCache 
         )
 
-
 if __name__ == "__main__":
-    torch.cuda.empty_cache() # Clear CUDA cache at start
+    torch.cuda.empty_cache()
     fire.Fire(main)
-
-
-
-
-
-
-
-
-
-
-
-
-
 

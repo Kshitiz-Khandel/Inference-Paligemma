@@ -1,10 +1,10 @@
-
-
 import torch
 from torch import nn
 from typing import Optional, Tuple, List
 import math
+import enum
 from siglip import SiglipVisionConfig, SiglipVisionModel
+
 
 class KVCache():
     def __init__(self) -> None:
@@ -37,6 +37,12 @@ class KVCache():
         # ... and then we return all the existing keys + the new ones.
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
+
+class AttentionType(enum.Enum):
+    GLOBAL = 1
+    LOCAL_SLIDING = 2
+
+
 class GemmaConfig():
     def __init__(
         self,
@@ -53,6 +59,8 @@ class GemmaConfig():
         attention_bias=False,
         attention_dropout=0.0,
         pad_token_id=None,
+        sliding_window_size=4096,
+        attn_types=None,
         **kwargs,
     ):
         super().__init__()
@@ -69,6 +77,15 @@ class GemmaConfig():
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.pad_token_id = pad_token_id
+        self.sliding_window_size = sliding_window_size
+        
+        # Default to alternating attention types if not specified
+        if attn_types is None:
+            assert self.num_hidden_layers % 2 == 0
+            self.attn_types = [AttentionType.LOCAL_SLIDING, AttentionType.GLOBAL] * int(self.num_hidden_layers/2)
+        else:
+            self.attn_types = attn_types
+
 
 class PaliGemmaConfig():
     def __init__(
@@ -116,6 +133,7 @@ class GemmaRMSNorm(nn.Module):
         output = self._norm(x.float())
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
+
 
 class GemmaRotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
@@ -170,6 +188,7 @@ class GemmaMLP(nn.Module):
     def forward(self, x):
         return self.down_proj(nn.functional.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
 
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
@@ -177,11 +196,13 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
+
 class GemmaAttention(nn.Module):
-    def __init__(self, config: GemmaConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: GemmaConfig, layer_idx: Optional[int] = None, attn_type: AttentionType = AttentionType.GLOBAL):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.attn_type = attn_type
 
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
@@ -192,6 +213,7 @@ class GemmaAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
+        self.sliding_window_size = config.sliding_window_size
 
         assert self.hidden_size % self.num_heads == 0          
 
@@ -232,6 +254,24 @@ class GemmaAttention(nn.Module):
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         assert attention_mask is not None
+        
+        # Apply sliding window attention if this layer uses it
+        if (
+            self.attn_type == AttentionType.LOCAL_SLIDING
+            and self.sliding_window_size is not None
+        ):
+            # Create sliding window mask
+            seq_len = attention_mask.shape[-1]
+            all_ones = torch.ones_like(attention_mask)
+            sliding_mask = torch.triu(
+                all_ones, -1 * self.sliding_window_size + 1
+            ) * torch.tril(all_ones, self.sliding_window_size - 1)
+            
+            # Apply sliding window to attention mask
+            dtype = attention_mask.dtype
+            min_dtype = torch.finfo(dtype).min
+            attention_mask = torch.where(sliding_mask == 1, attention_mask, min_dtype)
+        
         attn_weights = attn_weights + attention_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -249,12 +289,16 @@ class GemmaAttention(nn.Module):
 
         return attn_output, attn_weights
 
+
 class GemmaDecoderLayer(nn.Module):
     def __init__(self, config: GemmaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        
+        # Get attention type for this layer
+        attn_type = config.attn_types[layer_idx] if config.attn_types and layer_idx < len(config.attn_types) else AttentionType.GLOBAL
 
-        self.self_attn = GemmaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = GemmaAttention(config=config, layer_idx=layer_idx, attn_type=attn_type)
 
         self.mlp = GemmaMLP(config)
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -285,6 +329,7 @@ class GemmaDecoderLayer(nn.Module):
 
         return hidden_states
 
+
 class GemmaModel(nn.Module):
     def __init__(self, config: GemmaConfig):
         super().__init__()
@@ -296,6 +341,7 @@ class GemmaModel(nn.Module):
         self.layers = nn.ModuleList(
             [GemmaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
+        
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self):
@@ -323,6 +369,7 @@ class GemmaModel(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         return hidden_states
+
 
 class GemmaForCausalLM(nn.Module):
     def __init__(self, config):
@@ -365,6 +412,7 @@ class GemmaForCausalLM(nn.Module):
 
         return return_data
 
+
 class PaliGemmaMultiModalProjector(nn.Module):
     def __init__(self, config: PaliGemmaConfig):
         super().__init__()
@@ -373,6 +421,7 @@ class PaliGemmaMultiModalProjector(nn.Module):
     def forward(self, image_features):
         hidden_states = self.linear(image_features)
         return hidden_states
+
 
 class PaliGemmaForConditionalGeneration(nn.Module):
     def __init__(self, config: PaliGemmaConfig):
@@ -396,13 +445,13 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         batch_size, sequence_length, embed_dim = inputs_embeds.shape
         # image_features: [Batch_Size, Num_Patches, Projection_Dim]
         # inputs_embeds: [Batch_Size, Seq_Len, Hidden_Size]
-        
+
         scaled_image_features = image_features / (self.config.hidden_size**0.5)
-        
+
         # Create a placeholder for the final merged embedding
         final_embedding = torch.zeros(batch_size, sequence_length, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
-        
-        # Masks are batch-aware
+
+        # Masks are now batch-aware
         text_mask = (input_ids != self.config.image_token_index) & (input_ids != self.pad_token_id)
         image_mask = input_ids == self.config.image_token_index
         pad_mask = input_ids == self.pad_token_id
@@ -412,7 +461,9 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         image_mask_expanded = image_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
 
         final_embedding = torch.where(text_mask_expanded, inputs_embeds, final_embedding)
-        
+
+        # image_features [batch_size, num_patches, projection_dim]
+
         final_embedding = final_embedding.masked_scatter(image_mask_expanded, scaled_image_features)
         final_embedding = torch.where(pad_mask_expanded, torch.zeros_like(final_embedding), final_embedding)
 
@@ -420,7 +471,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         dtype, device = inputs_embeds.dtype, inputs_embeds.device
         min_dtype = torch.finfo(dtype).min
         q_len = inputs_embeds.shape[1]
-        
+
         if kv_cache is None or kv_cache.num_items() == 0:
             # Prefill phase: causal mask for the full sequence
             # For batching, this mask is applied across all items in the batch
@@ -435,7 +486,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             kv_len = kv_cache.num_items() + q_len
             # Mask for current token attending to all previous tokens in its respective sequence
             causal_mask = torch.zeros((batch_size, q_len, kv_len), dtype=dtype, device=device)
-        
+
         # Combine with attention_mask from input (which handles padding in the prefill phase)
         # attention_mask from input is [batch_size, seq_len]
         # Expanded to [batch_size, 1, 1, seq_len] for broadcasting with causal_mask (after adding head dim)
@@ -444,7 +495,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
 
         if kv_cache is not None and kv_cache.num_items() > 0:
             # Position IDs for decoding phase: last position of each sequence
-            
+            # This assumes attention_mask correctly reflects the current sequence length for each item.
             position_ids = attention_mask.sum(dim=-1, keepdim=True) - 1
             # Ensure position_ids are within valid range (0 to max_position_embeddings-1)
             position_ids = torch.clamp(position_ids, min=0)
