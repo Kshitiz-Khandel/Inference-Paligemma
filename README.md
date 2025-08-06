@@ -7,7 +7,7 @@
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/Kshitiz-Khandel/Paligemma.git
+   git clone https://github.com/Kshitiz-Khandel/Inference-Paligemma.git
    cd src
    ```
 
@@ -62,8 +62,7 @@ DO_SAMPLE="False"
 # Whether to use CPU only
 ONLY_CPU="False"
 
-#"SWA" for Sliding Window Attentionor  or "GLOBAL" for Vanilla Attention
-ATTENTION_TYPE="SWA" ## "SWA" for Sliding Window Attentionor GLOBAL or "GLOBAL" for Vanilla Attention
+
 
 
 python inference.py \
@@ -75,7 +74,6 @@ python inference.py \
     --top_p $TOP_P \
     --do_sample $DO_SAMPLE \
     --only_cpu $ONLY_CPU \
-    --attention_type "$ATTENTION_TYPE" \
 ```
 
 ## Citation
