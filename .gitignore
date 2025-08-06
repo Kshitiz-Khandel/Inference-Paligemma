@@ -1,0 +1,10 @@
+# Ignore Jupyter notebook checkpoints
+# Byte-compiled / cache files
+**/__pycache__/
+__pycache__/
+*.py[cod]
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+*checkpoint*
