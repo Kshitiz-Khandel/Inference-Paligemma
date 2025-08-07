@@ -13,7 +13,13 @@
 
 2. Install the required dependencies:
    ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+
    pip install -r requirements.txt
+   sudo apt-get update
+   sudo apt-get install --reinstall libc-bin
+   export PATH=$PATH:/sbin:/usr/sbin
    ```
 
 3. Download the model weights:

@@ -1,10 +1,10 @@
 
-MODEL_PATH="/home/jupyter/Paligemma2/google/paligemma-3b-pt-896"  
+MODEL_PATH="/home/jupyter/Paligemma/google/paligemma-3b-pt-896"  
 
 PROMPT="the dog is ,the building is ,the mountain is "
 
 # Comma-separated list of image file paths (must match number of prompts)
-IMAGE_FILE_PATH="/home/jupyter/Paligemma2/images/dog.jpeg,/home/jupyter/Paligemma2/images/building.jpeg,/home/jupyter/Paligemma2/images/mountains.jpeg"
+IMAGE_FILE_PATH="/home/jupyter/Inference-Paligemma/Images/dog.jpeg,/home/jupyter/Inference-Paligemma/Images/building.jpeg,/home/jupyter/Inference-Paligemma/Images/mountains.jpeg"
 
 MAX_TOKENS_TO_GENERATE=100
 TEMPERATURE=0.8
