@@ -6,7 +6,7 @@ import fire
 from typing import List, Optional, Tuple
 
 from processing_paligemma import PaliGemmaProcessor
-from gemma_swa import KVCache, PaliGemmaForConditionalGeneration
+from gemma_decoder import KVCache, PaliGemmaForConditionalGeneration
 from utils import load_hf_model 
 from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler, schedule
 
