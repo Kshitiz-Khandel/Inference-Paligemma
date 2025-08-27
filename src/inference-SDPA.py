@@ -1,5 +1,4 @@
 ## Inference.py for Paligemma (Modified for Batch Inference)
-## Flash Attention
 
 from PIL import Image
 import torch
@@ -80,28 +79,9 @@ def test_batch_inference(
     do_sample: bool,
 ):
     model_inputs = get_model_inputs(processor, prompts, image_file_paths, device)
-
     input_ids = model_inputs["input_ids"]
     attention_mask = model_inputs["attention_mask"]
     pixel_values = model_inputs["pixel_values"]
-    print("DEBUG shapes: input_ids", input_ids.shape, "attention_mask", attention_mask.shape, "pixel_values", pixel_values.shape)
-    ## Added from here till  attention_mask = attention_mask.unsqueeze(1).expand(-1, seq_len).contiguous()
-
-    input_ids = model_inputs["input_ids"]
-    attention_mask = model_inputs["attention_mask"]
-    pixel_values = model_inputs["pixel_values"]
-
-    # Defensive: ensure attention_mask has shape [B, seq_len].
-    # Some tokenizers (or downstream code) may produce a 1-D mask [B].
-    if attention_mask.dim() == 1:
-        seq_len = input_ids.shape[1]
-        # If mask is single-value per sample (e.g., all ones), expand to per-token mask
-        attention_mask = attention_mask.unsqueeze(1).expand(-1, seq_len).contiguous()
-    elif attention_mask.dim() == 3 and attention_mask.shape[1] == 1 and attention_mask.shape[2] == 1:
-        # unlikely, but if mask is [B,1,1] expand to [B, seq_len] (defensive)
-        seq_len = input_ids.shape[1]
-        attention_mask = attention_mask.squeeze(1).squeeze(1)
-        attention_mask = attention_mask.unsqueeze(1).expand(-1, seq_len).contiguous()
 
     batch_size = input_ids.shape[0]
     kv_cache = KVCache()
@@ -246,13 +226,12 @@ def main(
     model = model.to(device).eval()
 
     if device == "cuda":
-        model=model
         # Using bfloat16 and torch.compile for performance on CUDA-enabled GPUs
         model = model.to(torch.bfloat16)
         # apply_fake_sparsity(model) # This prunes weights to 2:4 pattern (makes values zero)
         # apply_sparse_semistructured(model)
         
-        #model = torch.compile(model)
+        model = torch.compile(model)
 
     num_image_tokens = model.config.vision_config.num_image_tokens
     image_size = model.config.vision_config.image_size
@@ -287,7 +266,6 @@ def main(
 if __name__ == "__main__":
     torch.cuda.empty_cache() # Clear CUDA cache at start
     fire.Fire(main)
-
 
 
 
