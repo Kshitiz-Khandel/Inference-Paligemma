@@ -1,4 +1,4 @@
-## Gemma Flash (Clean Version - Minimal Changes from SDPA)
+
 
 import torch
 from torch import nn
@@ -250,7 +250,8 @@ class GemmaAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         
         # Check if we're in decode phase
-        is_decode_phase = kv_cache is not None and kv_cache.num_items() > 0
+        #is_decode_phase = kv_cache is not None and kv_cache.num_items() > 0
+        is_decode_phase = (q_len == 1) and (kv_cache is not None and kv_cache.num_items() > 0)
         
         # Project to Q, K, V (same for both Flash and SDPA)
         query_states = self.q_proj(hidden_states)
@@ -286,6 +287,15 @@ class GemmaAttention(nn.Module):
             final_mask = attention_mask
         
         # Decide whether to use Flash Attention or SDPA
+        # use_flash_attn = (
+        #     _flash_attn_available and 
+        #     not is_decode_phase and  # Only during prefill
+        #     hidden_states.device.type == "cuda" and
+        #     hidden_states.dtype in (torch.float16, torch.bfloat16) and
+        #     final_mask is not None and final_mask.dim() == 4  # Standard 4D mask
+        # )
+        
+        
         use_flash_attn = (
             _flash_attn_available and 
             not is_decode_phase and  # Only during prefill
