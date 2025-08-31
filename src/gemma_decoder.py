@@ -1,3 +1,5 @@
+## Gemma SDPA
+
 import torch
 from torch import nn
 from typing import Optional, Tuple, List
@@ -521,10 +523,12 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         
         # 1. Extract the input embeddings
         inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
+        print("inputs_embeds",inputs_embeds.shape)
 
         # 2. Merge text and images
         selected_image_feature = self.vision_tower(pixel_values.to(inputs_embeds.dtype))
         image_features = self.multi_modal_projector(selected_image_feature)
+        print("image_features",image_features.shape)
 
         inputs_embeds, attention_mask, position_ids = self._merge_input_ids_with_image_features(image_features, inputs_embeds, input_ids, attention_mask, kv_cache)
         

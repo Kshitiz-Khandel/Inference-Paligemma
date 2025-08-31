@@ -1,5 +1,5 @@
-## Inference.py for Paligemma (Modified for Batch Inference)
-## inference SDPA
+# # Inference.py for Paligemma (Modified for Batch Inference)
+# # Flash Attention
 
 from PIL import Image
 import torch
@@ -7,8 +7,8 @@ import fire
 from typing import List, Optional, Tuple
 
 from processing_paligemma import PaliGemmaProcessor
-from gemma_decoder import KVCache, PaliGemmaForConditionalGeneration
-from utils import load_hf_model 
+from gemma_flash import KVCache, PaliGemmaForConditionalGeneration
+from utils import load_hf_model
 from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler, schedule
 
 
@@ -17,14 +17,13 @@ def move_inputs_to_device(model_inputs: dict, device: str):
     return model_inputs
 
 
-
 def get_model_inputs(
     processor: PaliGemmaProcessor, prompts: List[str], image_file_paths: List[str], device: str
 ):
     images = []
     for f_path in image_file_paths:
         try:
-            img = Image.open(f_path).convert("RGB") # Ensure consistent mode
+            img = Image.open(f_path).convert("RGB")
             images.append(img)
         except FileNotFoundError:
             print(f"Warning: Image file not found: {f_path}. Skipping this image.")
@@ -34,7 +33,6 @@ def get_model_inputs(
     if not images:
         raise ValueError("No valid images found for processing.")
     if len(images) != len(prompts):
-        # This can happen if some image files were not found
         raise ValueError(
             f"Mismatch: Successfully loaded {len(images)} images, but have {len(prompts)} prompts. "
             "Ensure all image files exist and are accessible."
@@ -46,16 +44,12 @@ def get_model_inputs(
 
 
 def _sample_top_p(probs: torch.Tensor, p: float):
-    # probs: (B, vocab_size)
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     mask = probs_sum - probs_sort > p
     probs_sort[mask] = 0.0
 
-    # Handle cases where all probabilities become zero after masking
     sum_probs_sort = probs_sort.sum(dim=-1, keepdim=True)
-    # If a row sums to 0, distribute probability uniformly to avoid NaNs.
-    # This ensures multinomial doesn't fail.
     probs_sort = torch.where(
         sum_probs_sort == 0,
         torch.ones_like(probs_sort) / probs_sort.shape[-1],
@@ -79,28 +73,23 @@ def test_batch_inference(
     top_p: float,
     do_sample: bool,
 ):
+    # --- Prefill Step ---
     model_inputs = get_model_inputs(processor, prompts, image_file_paths, device)
     input_ids = model_inputs["input_ids"]
     attention_mask = model_inputs["attention_mask"]
-    pixel_values = model_inputs["pixel_values"]
+    pixel_values = model_inputs["pixel_values"] # Get pixel values once
+    print("DEBUG shapes: input_ids", input_ids.shape, "attention_mask", attention_mask.shape, "pixel_values", pixel_values.shape)
 
     batch_size = input_ids.shape[0]
-    kv_cache = KVCache()
-
-    stop_token = processor.tokenizer.eos_token_id
-    generated_tokens_batch: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
     
-    # Track which sequences are still active (haven't generated EOS)
+    # ✅ Initialize kv_cache to None, it will be created on the first model call
+    kv_cache = None
+    generated_tokens_batch = [[] for _ in range(batch_size)]
     active_sequences = torch.ones(batch_size, dtype=torch.bool, device=device)
 
-    # Profiler setup (as in your reference script)
-    tb_logdir = "/home/jupyter/Paligemma2/PyTorch-PaliGemma-2/logs/tb_logdir_batch"
-    prof_sched = schedule(
-        wait=1,
-        warmup=2,
-        active=5,
-        repeat=1
-    )
+    # --- Profiler Setup ---
+    tb_logdir = "/home/jupyter/Paligemma2/PyTorch-PaliGemma-2/logs/tb_logdir_batch/output"
+    prof_sched = schedule(wait=1, warmup=2, active=5, repeat=1)
 
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -111,89 +100,74 @@ def test_batch_inference(
         profile_memory=True,
         with_flops=True
     ) as prof:
+        
+        # --- Decoding Loop ---
         for i in range(max_tokens_to_generate):
-            # Break if all sequences have stopped
             if not active_sequences.any():
                 break
 
-            # Only consider active sequences for the current forward pass
-            # We need to filter inputs for the current active sequences only
-            current_input_ids = input_ids[active_sequences]
-            current_attention_mask = attention_mask[active_sequences]
-            current_pixel_values=pixel_values
-            #current_pixel_values = pixel_values[active_sequences] if i == 0 else None # Vision model only processes once
-
-            # When processing in batches, ensure the KV cache is updated for the full batch,
-            # even if some sequences are inactive. The model's internal attention mechanism
-            # (especially with padding) will handle inactive sequences appropriately.
-            # The kv_cache stores for all sequences initially.
-            
-            # The model's forward pass expects full batch, so we need to pass full input_ids and attention_mask
-            # and then handle the logits and next_token based on active_sequences.
-            # The KV cache update should also happen for all sequences.
+            # ✅ KEY CHANGE: Pass pixel_values only for the first token (prefill)
+            current_pixel_values = pixel_values if i == 0 else None
 
             outputs = model(
-                input_ids=input_ids, # Pass full input_ids (will contain generated tokens for active, EOS for inactive)
-                #pixel_values=pixel_values if i == 0 else None, # Pass original pixel_values only for the first step
-                pixel_values=pixel_values,
+                input_ids=input_ids,
+                pixel_values=current_pixel_values,
                 attention_mask=attention_mask,
                 kv_cache=kv_cache,
             )
+            
+            # ✅ CORRECTLY UPDATE a single kv_cache object
             kv_cache = outputs["kv_cache"]
-            next_token_logits = outputs["logits"][:, -1, :] # Logits for the last token of each sequence in the batch
+            next_token_logits = outputs["logits"][:, -1, :]
 
+            # --- (Rest of your sampling and token management logic is mostly correct) ---
+            
             # Filter logits for active sequences
-            next_token_logits_active = next_token_logits[active_sequences]
+            active_logits = next_token_logits[active_sequences]
 
             if do_sample:
-                next_token_active = _sample_top_p(next_token_logits_active / temperature, top_p)
+                next_tokens_active = _sample_top_p(active_logits / temperature, top_p)
             else:
-                next_token_active = torch.argmax(next_token_logits_active, dim=-1, keepdim=True)
+                next_tokens_active = torch.argmax(active_logits, dim=-1, keepdim=True)
             
-            # Create a full batch-sized tensor for the next tokens
-            # Initialize with padding_token_id or stop_token for inactive sequences
-            next_token_full_batch = torch.full(
+            # Create a full batch tensor for the next tokens, filling inactive with pad
+            next_tokens = torch.full(
                 (batch_size, 1),
-                fill_value=processor.tokenizer.pad_token_id, # Use pad_token_id for inactive sequences to not influence generation
+                fill_value=processor.tokenizer.pad_token_id,
                 dtype=torch.long,
                 device=device
             )
-            next_token_full_batch[active_sequences] = next_token_active.squeeze(-1).unsqueeze(-1) # Ensure shape (N_active, 1)
+            next_tokens[active_sequences] = next_tokens_active
 
-            # Append generated tokens for active sequences only
-            # The generated_tokens_batch should accumulate tokens per original batch item
-            current_next_tokens_list = next_token_full_batch.squeeze(-1).tolist()
+            # Append generated tokens
             for j in range(batch_size):
                 if active_sequences[j]:
-                    generated_tokens_batch[j].append(torch.tensor([current_next_tokens_list[j]], device=device))
+                    generated_tokens_batch[j].append(next_tokens[j])
 
-            # Update active sequences based on stop token
-            # If a token is stop_token, that sequence becomes inactive.
-            newly_stopped = (next_token_full_batch.squeeze(-1) == stop_token)
+            # Update active sequences
+            newly_stopped = (next_tokens.squeeze(-1) == processor.tokenizer.eos_token_id)
             active_sequences = active_sequences & (~newly_stopped)
 
-            # Update input_ids for the next iteration: it's now just the newly generated tokens
-            input_ids = next_token_full_batch
+            # ✅ Set up inputs for the NEXT iteration
+            input_ids = next_tokens
+            attention_mask = torch.cat([
+                attention_mask, 
+                torch.ones((batch_size, 1), dtype=torch.long, device=device)
+            ], dim=-1)
 
-            # Update attention_mask for the next iteration (append a 1 for the new token for all original sequences)
-            # The attention mask needs to grow for all sequences in the batch, padding appropriately.
-            attention_mask = torch.cat(
-                [attention_mask, torch.ones((batch_size, 1), device=input_ids.device)], dim=-1
-            )
-            
             prof.step()
 
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
 
+    # --- (Decoding and printing logic remains the same) ---
     final_decoded_outputs = []
     for i in range(batch_size):
         if generated_tokens_batch[i]:
             decoded = processor.tokenizer.decode(
-                torch.cat(generated_tokens_batch[i], dim=-1), skip_special_tokens=True
+                torch.cat(generated_tokens_batch[i]), skip_special_tokens=True
             )
         else:
-            decoded = "(No tokens generated)" # Fallback if for some reason no tokens were generated
-
+            decoded = "(No tokens generated)"
         final_decoded_outputs.append(f"{prompts[i]}: {decoded.strip()}")
 
     print("\n-----------------------------------------------------------------------")
@@ -205,8 +179,8 @@ def test_batch_inference(
 
 def main(
     model_path: str = None,
-    prompts: str = None,  # Expecting a comma-separated string for multiple prompts
-    image_file_paths: str = None,  # Expecting a comma-separated string for multiple image paths
+    prompts: str = None,
+    image_file_paths: str = None,
     max_tokens_to_generate: int = 100,
     temperature: float = 0.8,
     top_p: float = 0.9,
@@ -219,7 +193,6 @@ def main(
             device = "cuda"
         elif torch.backends.mps.is_available():
             device = "mps"
-
     print("Device in use: ", device)
 
     print(f"Loading model from {model_path}")
@@ -227,22 +200,13 @@ def main(
     model = model.to(device).eval()
 
     if device == "cuda":
-        # Using bfloat16 and torch.compile for performance on CUDA-enabled GPUs
         model = model.to(torch.bfloat16)
-        # apply_fake_sparsity(model) # This prunes weights to 2:4 pattern (makes values zero)
-        # apply_sparse_semistructured(model)
-        
-        model = torch.compile(model)
 
-    num_image_tokens = model.config.vision_config.num_image_tokens
-    image_size = model.config.vision_config.image_size
-    processor = PaliGemmaProcessor(tokenizer, num_image_tokens, image_size)
+    processor = PaliGemmaProcessor(tokenizer, model.config.text_config.num_image_tokens, model.config.vision_config.image_size)
 
-    # Convert comma-separated strings to lists
     prompts_list = [p.strip() for p in prompts.split(',') if p.strip()] if prompts else []
     image_file_paths_list = [f.strip() for f in image_file_paths.split(',') if f.strip()] if image_file_paths else []
 
-    # Ensure number of prompts matches number of images
     if len(prompts_list) != len(image_file_paths_list):
         raise ValueError("Number of prompts must match number of image file paths for batch inference.")
     if not prompts_list:
@@ -265,18 +229,5 @@ def main(
 
 
 if __name__ == "__main__":
-    torch.cuda.empty_cache() # Clear CUDA cache at start
+    torch.cuda.empty_cache()
     fire.Fire(main)
-
-
-
-
-
-
-
-
-
-
-
-
-

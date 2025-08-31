@@ -1,5 +1,4 @@
-## Inference.py for Paligemma (Modified for Batch Inference)
-## Flash Attention
+## Inference.py for Paligemma (Fixed Flash Attention Version)
 
 from PIL import Image
 import torch
@@ -7,7 +6,7 @@ import fire
 from typing import List, Optional, Tuple
 
 from processing_paligemma import PaliGemmaProcessor
-from gemma_decoder import KVCache, PaliGemmaForConditionalGeneration
+from gemma_flash import KVCache, PaliGemmaForConditionalGeneration
 from utils import load_hf_model 
 from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler, schedule
 
@@ -15,7 +14,6 @@ from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler,
 def move_inputs_to_device(model_inputs: dict, device: str):
     model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
     return model_inputs
-
 
 
 def get_model_inputs(
@@ -80,28 +78,9 @@ def test_batch_inference(
     do_sample: bool,
 ):
     model_inputs = get_model_inputs(processor, prompts, image_file_paths, device)
-
     input_ids = model_inputs["input_ids"]
     attention_mask = model_inputs["attention_mask"]
     pixel_values = model_inputs["pixel_values"]
-    print("DEBUG shapes: input_ids", input_ids.shape, "attention_mask", attention_mask.shape, "pixel_values", pixel_values.shape)
-    ## Added from here till  attention_mask = attention_mask.unsqueeze(1).expand(-1, seq_len).contiguous()
-
-    input_ids = model_inputs["input_ids"]
-    attention_mask = model_inputs["attention_mask"]
-    pixel_values = model_inputs["pixel_values"]
-
-    # Defensive: ensure attention_mask has shape [B, seq_len].
-    # Some tokenizers (or downstream code) may produce a 1-D mask [B].
-    if attention_mask.dim() == 1:
-        seq_len = input_ids.shape[1]
-        # If mask is single-value per sample (e.g., all ones), expand to per-token mask
-        attention_mask = attention_mask.unsqueeze(1).expand(-1, seq_len).contiguous()
-    elif attention_mask.dim() == 3 and attention_mask.shape[1] == 1 and attention_mask.shape[2] == 1:
-        # unlikely, but if mask is [B,1,1] expand to [B, seq_len] (defensive)
-        seq_len = input_ids.shape[1]
-        attention_mask = attention_mask.squeeze(1).squeeze(1)
-        attention_mask = attention_mask.unsqueeze(1).expand(-1, seq_len).contiguous()
 
     batch_size = input_ids.shape[0]
     kv_cache = KVCache()
@@ -112,8 +91,8 @@ def test_batch_inference(
     # Track which sequences are still active (haven't generated EOS)
     active_sequences = torch.ones(batch_size, dtype=torch.bool, device=device)
 
-    # Profiler setup (as in your reference script)
-    tb_logdir = "/home/jupyter/Paligemma2/PyTorch-PaliGemma-2/logs/tb_logdir_batch"
+    # Profiler setup
+    tb_logdir = "/home/jupyter/Paligemma2/PyTorch-PaliGemma-2/logs/tb_logdir_batch/flash"
     prof_sched = schedule(
         wait=1,
         warmup=2,
@@ -135,27 +114,17 @@ def test_batch_inference(
             if not active_sequences.any():
                 break
 
-            # Only consider active sequences for the current forward pass
-            # We need to filter inputs for the current active sequences only
-            current_input_ids = input_ids[active_sequences]
-            current_attention_mask = attention_mask[active_sequences]
-            current_pixel_values=pixel_values
-            #current_pixel_values = pixel_values[active_sequences] if i == 0 else None # Vision model only processes once
+            # KEY FIX: Only pass pixel_values on the first iteration (prefill)
+            current_pixel_values = pixel_values if i == 0 else None
 
-            # When processing in batches, ensure the KV cache is updated for the full batch,
-            # even if some sequences are inactive. The model's internal attention mechanism
-            # (especially with padding) will handle inactive sequences appropriately.
-            # The kv_cache stores for all sequences initially.
-            
-            # The model's forward pass expects full batch, so we need to pass full input_ids and attention_mask
-            # and then handle the logits and next_token based on active_sequences.
-            # The KV cache update should also happen for all sequences.
+            # Only consider active sequences for the current forward pass
+            current_input_ids = input_ids
+            current_attention_mask = attention_mask
 
             outputs = model(
-                input_ids=input_ids, # Pass full input_ids (will contain generated tokens for active, EOS for inactive)
-                #pixel_values=pixel_values if i == 0 else None, # Pass original pixel_values only for the first step
-                pixel_values=pixel_values,
-                attention_mask=attention_mask,
+                input_ids=current_input_ids,
+                pixel_values=current_pixel_values,  # None after first iteration
+                attention_mask=current_attention_mask,
                 kv_cache=kv_cache,
             )
             kv_cache = outputs["kv_cache"]
@@ -246,13 +215,9 @@ def main(
     model = model.to(device).eval()
 
     if device == "cuda":
-        model=model
         # Using bfloat16 and torch.compile for performance on CUDA-enabled GPUs
         model = model.to(torch.bfloat16)
-        # apply_fake_sparsity(model) # This prunes weights to 2:4 pattern (makes values zero)
-        # apply_sparse_semistructured(model)
-        
-        #model = torch.compile(model)
+        model = torch.compile(model)
 
     num_image_tokens = model.config.vision_config.num_image_tokens
     image_size = model.config.vision_config.image_size
@@ -287,17 +252,3 @@ def main(
 if __name__ == "__main__":
     torch.cuda.empty_cache() # Clear CUDA cache at start
     fire.Fire(main)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
