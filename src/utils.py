@@ -1,5 +1,4 @@
 from gemma_flash import PaliGemmaForConditionalGeneration, PaliGemmaConfig
-#from gemma_decoder import PaliGemmaForConditionalGeneration, PaliGemmaConfig
 from transformers import AutoTokenizer
 import json
 import glob

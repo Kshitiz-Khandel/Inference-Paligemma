@@ -1,5 +1,3 @@
-
-
 import torch
 from torch import nn
 from typing import Optional, Tuple, List
@@ -12,9 +10,9 @@ import torch.nn.functional as F
 try:
     from flash_attn import flash_attn_func
     _flash_attn_available = True
-    print("✅ FlashAttention is available and will be used.")
+    print("FlashAttention is available and will be used.")
 except ImportError:
-    print("⚠️ FlashAttention is not installed. Falling back to default PyTorch attention.")
+    print("FlashAttention is not installed. Falling back to default PyTorch attention.")
     _flash_attn_available = False
 
 
@@ -22,7 +20,7 @@ class KVCache():
     def __init__(self) -> None:
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
-    
+
     def num_items(self) -> int:
         if len(self.key_cache) == 0:
             return 0
@@ -150,23 +148,22 @@ class GemmaRMSNorm(nn.Module):
 class GemmaRotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
-
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
         self.register_buffer("inv_freq", tensor=inv_freq, persistent=False)
 
     @torch.no_grad()
     def forward(self, x, position_ids, seq_len=None):
-        self.inv_freq.to(x.device)
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            freqs = torch.einsum(
+                "d,bs->bsd",
+                self.inv_freq.to(x.device).float(),
+                position_ids.float(),
+            )
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos()
             sin = emb.sin()
@@ -215,7 +212,6 @@ class GemmaAttention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.attn_type = attn_type
-
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -226,8 +222,7 @@ class GemmaAttention(nn.Module):
         self.rope_theta = config.rope_theta
         self.is_causal = True
         self.sliding_window_size = config.sliding_window_size
-
-        assert self.hidden_size % self.num_heads == 0          
+        assert self.hidden_size % self.num_heads == 0        
 
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
@@ -249,17 +244,20 @@ class GemmaAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
         
-        # Check if we're in decode phase
-        #is_decode_phase = kv_cache is not None and kv_cache.num_items() > 0
         is_decode_phase = (q_len == 1) and (kv_cache is not None and kv_cache.num_items() > 0)
         
-        # Project to Q, K, V (same for both Flash and SDPA)
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        
+    
+        query_states = torch.einsum('bsnh->bnsh', query_states)
+        key_states = torch.einsum('bsnh->bnsh', key_states)
+        value_states = torch.einsum('bsnh->bnsh', value_states)
 
         cos, sin = self.rotary_emb(value_states, position_ids, seq_len=None)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -270,50 +268,32 @@ class GemmaAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         
-        # Handle sliding window attention
         final_mask = attention_mask
         if self.attn_type == AttentionType.LOCAL_SLIDING and self.sliding_window_size is not None:
-            # Create the sliding window mask (same as SDPA version)
             seq_len = attention_mask.shape[-1]
             all_ones = torch.ones_like(attention_mask)
             sliding_mask = torch.triu(
                 all_ones, -1 * self.sliding_window_size + 1
             ) * torch.tril(all_ones, self.sliding_window_size - 1)
             
-            # Apply sliding window to attention mask
             dtype = attention_mask.dtype
             min_dtype = torch.finfo(dtype).min
             attention_mask = torch.where(sliding_mask == 1, attention_mask, min_dtype)
             final_mask = attention_mask
         
-        # Decide whether to use Flash Attention or SDPA
-        # use_flash_attn = (
-        #     _flash_attn_available and 
-        #     not is_decode_phase and  # Only during prefill
-        #     hidden_states.device.type == "cuda" and
-        #     hidden_states.dtype in (torch.float16, torch.bfloat16) and
-        #     final_mask is not None and final_mask.dim() == 4  # Standard 4D mask
-        # )
-        
-        
         use_flash_attn = (
             _flash_attn_available and 
-            not is_decode_phase and  # Only during prefill
+            not is_decode_phase and 
             hidden_states.device.type == "cuda" and
             hidden_states.dtype in (torch.float16, torch.bfloat16) and
-            final_mask is not None and final_mask.dim() == 4  # Standard 4D mask
+            final_mask is not None and final_mask.dim() == 4
         )
         
         if use_flash_attn:
             print(f"Layer {self.layer_idx}: Using Flash Attention (Prefill)")
-            # Convert 4D mask to 2D for Flash Attention
-            # final_mask shape: [batch, 1, seq_len, seq_len] -> [batch, seq_len, seq_len]
-            mask_2d = final_mask.squeeze(1)  # Remove head dimension
-            
-            # Flash Attention expects [batch, seq_len, num_heads, head_dim]
-            q_flash = query_states.transpose(1, 2)  # [batch, seq_len, num_heads, head_dim]
-            k_flash = key_states.transpose(1, 2)    # [batch, seq_len, num_heads, head_dim]
-            v_flash = value_states.transpose(1, 2)  # [batch, seq_len, num_heads, head_dim]
+            q_flash = query_states.transpose(1, 2)
+            k_flash = key_states.transpose(1, 2)
+            v_flash = value_states.transpose(1, 2)
             
             attn_output = flash_attn_func(
                 q_flash, k_flash, v_flash,
@@ -321,8 +301,7 @@ class GemmaAttention(nn.Module):
                 causal=True,
                 window_size=(self.sliding_window_size - 1, 0) if self.attn_type == AttentionType.LOCAL_SLIDING else (-1, -1)
             )
-            print("Flash attention", attn_output.shape)
-            # attn_output is already in [batch, seq_len, num_heads, head_dim] format
+            
         else:
             print(f"Layer {self.layer_idx}: Using SDPA ({'Decode' if is_decode_phase else 'Prefill'})")
             attn_output = F.scaled_dot_product_attention(
@@ -331,13 +310,11 @@ class GemmaAttention(nn.Module):
                 value=value_states,
                 attn_mask=final_mask,
                 dropout_p=self.attention_dropout if self.training else 0.0,
-                is_causal=False, # We use a custom mask, so is_causal must be False.
+                is_causal=False,
             )
-            print("SDPA attention", attn_output.shape)
-            # Convert to [batch, seq_len, num_heads, head_dim] format
+            
             attn_output = attn_output.transpose(1, 2).contiguous()
     
-        # Final projection (same for both)
         attn_output = attn_output.view(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
     
@@ -348,12 +325,8 @@ class GemmaDecoderLayer(nn.Module):
     def __init__(self, config: GemmaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        
-        # Get attention type for this layer
         attn_type = config.attn_types[layer_idx] if config.attn_types and layer_idx < len(config.attn_types) else AttentionType.GLOBAL
-
         self.self_attn = GemmaAttention(config=config, layer_idx=layer_idx, attn_type=attn_type)
-
         self.mlp = GemmaMLP(config)
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -390,12 +363,10 @@ class GemmaModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [GemmaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self):
@@ -421,7 +392,6 @@ class GemmaModel(nn.Module):
             )
 
         hidden_states = self.norm(hidden_states)
-
         return hidden_states
 
 
@@ -452,18 +422,12 @@ class GemmaForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             kv_cache=kv_cache,
         )
-
         hidden_states = outputs
         logits = self.lm_head(hidden_states)
         logits = logits.float()
-
-        return_data = {
-            "logits": logits,
-        }
-
+        return_data = {"logits": logits}
         if kv_cache is not None:
             return_data["kv_cache"] = kv_cache
-
         return return_data
 
 
@@ -484,10 +448,8 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         self.vision_tower = SiglipVisionModel(config.vision_config)
         self.multi_modal_projector = PaliGemmaMultiModalProjector(config)
         self.vocab_size = config.vocab_size
-
         language_model = GemmaForCausalLM(config.text_config)
         self.language_model = language_model
-
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
 
     def tie_weights(self):
@@ -497,28 +459,16 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         self, image_features: torch.Tensor, inputs_embeds: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor, kv_cache: Optional[KVCache] = None
     ):
         batch_size, sequence_length, embed_dim = inputs_embeds.shape
-        # image_features: [Batch_Size, Num_Patches, Projection_Dim]
-        # inputs_embeds: [Batch_Size, Seq_Len, Hidden_Size]
-
         scaled_image_features = image_features / (self.config.hidden_size**0.5)
-
-        # Create a placeholder for the final merged embedding
-        final_embedding = torch.zeros(batch_size, sequence_length, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
-
-        # Masks are now batch-aware
+        final_embedding = torch.zeros(
+            batch_size, sequence_length, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device
+        )
         text_mask = (input_ids != self.config.image_token_index) & (input_ids != self.pad_token_id)
         image_mask = input_ids == self.config.image_token_index
-        pad_mask = input_ids == self.pad_token_id
-
-        text_mask_expanded = text_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
-        pad_mask_expanded = pad_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
-        image_mask_expanded = image_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
-
+        text_mask_expanded = text_mask.unsqueeze(-1)
+        image_mask_expanded = image_mask.unsqueeze(-1)
         final_embedding = torch.where(text_mask_expanded, inputs_embeds, final_embedding)
-
-        # image_features [batch_size, num_patches, projection_dim]
         final_embedding = final_embedding.masked_scatter(image_mask_expanded, scaled_image_features)
-        final_embedding = torch.where(pad_mask_expanded, torch.zeros_like(final_embedding), final_embedding)
 
         #### CREATE THE ATTENTION MASK ####
         dtype, device = inputs_embeds.dtype, inputs_embeds.device
@@ -526,36 +476,25 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         q_len = inputs_embeds.shape[1]
 
         if kv_cache is None or kv_cache.num_items() == 0:
-            # Prefill phase: causal mask for the full sequence
-            # For batching, this mask is applied across all items in the batch
-            causal_mask = torch.full(
-                (q_len, q_len), fill_value=0, dtype=dtype, device=device
-            )
+            # Prefill phase
+            causal_mask = torch.full((q_len, q_len), fill_value=0, dtype=dtype, device=device)
             causal_mask = causal_mask.triu(diagonal=1) * min_dtype
-            causal_mask = causal_mask.unsqueeze(0).expand(batch_size, -1, -1) # Expand to batch size
+            causal_mask = causal_mask.unsqueeze(0).expand(batch_size, -1, -1)
         else:
-            # Decoding phase: query is a single token per batch item
+            # Decoding phase
             assert q_len == 1
             kv_len = kv_cache.num_items() + q_len
-            # Mask for current token attending to all previous tokens in its respective sequence
             causal_mask = torch.zeros((batch_size, q_len, kv_len), dtype=dtype, device=device)
 
-        # Combine with attention_mask from input (which handles padding in the prefill phase)
-        # attention_mask from input is [batch_size, seq_len]
-        # Expanded to [batch_size, 1, 1, seq_len] for broadcasting with causal_mask (after adding head dim)
         input_attention_mask_expanded = (1.0 - attention_mask[:, None, None, :]).to(dtype) * min_dtype
-        causal_mask = causal_mask.unsqueeze(1) + input_attention_mask_expanded # Add head dim later
+        causal_mask = causal_mask.unsqueeze(1) + input_attention_mask_expanded
 
         if kv_cache is not None and kv_cache.num_items() > 0:
-            # Position IDs for decoding phase: last position of each sequence
-            # This assumes attention_mask correctly reflects the current sequence length for each item.
             position_ids = attention_mask.sum(dim=-1, keepdim=True) - 1
-            # Ensure position_ids are within valid range (0 to max_position_embeddings-1)
             position_ids = torch.clamp(position_ids, min=0)
         else:
-            # Position IDs for prefill phase: cumsum based on non-padded tokens
             position_ids = (attention_mask.cumsum(-1) - 1).masked_fill_(attention_mask == 0, 0)
-            position_ids.clamp_(min=0) # Ensure no negative values if cumsum starts from 0 for masked
+            position_ids.clamp_(min=0)
 
         return final_embedding, causal_mask, position_ids
 
@@ -566,11 +505,8 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple:
-        
-        # 1. Extract the input embeddings
         inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
 
-        # 2. Merge text and images ONLY if pixel_values is provided
         if pixel_values is not None:
             selected_image_feature = self.vision_tower(pixel_values.to(inputs_embeds.dtype))
             image_features = self.multi_modal_projector(selected_image_feature)
@@ -579,7 +515,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                 image_features, inputs_embeds, input_ids, attention_mask, kv_cache
             )
         else:
-            # Decode phase - create simple attention mask and position IDs
+            # Decode phase logic when no new images are processed
             dtype, device = inputs_embeds.dtype, inputs_embeds.device
             min_dtype = torch.finfo(dtype).min
             batch_size, q_len = input_ids.shape
@@ -607,3 +543,8 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         )
 
         return outputs
+
+
+    
+    
+ 
