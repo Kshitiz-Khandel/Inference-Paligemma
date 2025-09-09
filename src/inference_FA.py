@@ -110,16 +110,21 @@ def test_batch_inference(
         with_flops=True
     ) as prof:
         for i in range(max_tokens_to_generate):
+            print("active_sequences",active_sequences)
             # Break if all sequences have stopped
             if not active_sequences.any():
+                print("break")
                 break
 
             # KEY FIX: Only pass pixel_values on the first iteration (prefill)
             current_pixel_values = pixel_values if i == 0 else None
+            #print("current_pixel_values",current_pixel_values.shape)
 
             # Only consider active sequences for the current forward pass
             current_input_ids = input_ids
             current_attention_mask = attention_mask
+            print("current_input_ids",current_input_ids.shape)
+            print("current_attention_mask",current_attention_mask.shape)
 
             outputs = model(
                 input_ids=current_input_ids,
@@ -127,16 +132,26 @@ def test_batch_inference(
                 attention_mask=current_attention_mask,
                 kv_cache=kv_cache,
             )
+            print("outputs",outputs['logits'].shape)
             kv_cache = outputs["kv_cache"]
+            #print("kv_cache",kv_cache)
+            
             next_token_logits = outputs["logits"][:, -1, :] # Logits for the last token of each sequence in the batch
+            print("next_token_logits",next_token_logits)
+            print("next_token_logits shape",next_token_logits.shape)
 
             # Filter logits for active sequences
             next_token_logits_active = next_token_logits[active_sequences]
+            print("next_token_logits_active",next_token_logits_active)
+            print("next_token_logits_active shape",next_token_logits_active.shape)
 
             if do_sample:
                 next_token_active = _sample_top_p(next_token_logits_active / temperature, top_p)
+                print("next_token_active top p",next_token_active)
             else:
                 next_token_active = torch.argmax(next_token_logits_active, dim=-1, keepdim=True)
+                print("next_token_active argmax",next_token_active)
+                print("next_token_active argmax shape",next_token_active.shape)
             
             # Create a full batch-sized tensor for the next tokens
             # Initialize with padding_token_id or stop_token for inactive sequences
@@ -146,22 +161,38 @@ def test_batch_inference(
                 dtype=torch.long,
                 device=device
             )
-            next_token_full_batch[active_sequences] = next_token_active.squeeze(-1).unsqueeze(-1) # Ensure shape (N_active, 1)
+            print("next_token_full_batch",next_token_full_batch)
+            print("next_token_full_batch shape",next_token_full_batch.shape)
+            #next_token_full_batch[active_sequences] = next_token_active.squeeze(-1).unsqueeze(-1) # Ensure shape (N_active, 1)
+            next_token_full_batch[active_sequences] = next_token_active # Ensure shape (N_active, 1)
+            print("next_token_full_batch with acive sequences",next_token_full_batch)
+            print("next_token_full_batch with acive sequences shape",next_token_full_batch.shape)
 
             # Append generated tokens for active sequences only
             # The generated_tokens_batch should accumulate tokens per original batch item
             current_next_tokens_list = next_token_full_batch.squeeze(-1).tolist()
+            print("current_next_tokens_list",current_next_tokens_list)
             for j in range(batch_size):
                 if active_sequences[j]:
                     generated_tokens_batch[j].append(torch.tensor([current_next_tokens_list[j]], device=device))
+                    print("generated_tokens_batch",generated_tokens_batch)
 
             # Update active sequences based on stop token
             # If a token is stop_token, that sequence becomes inactive.
+            print("stop token",stop_token)
             newly_stopped = (next_token_full_batch.squeeze(-1) == stop_token)
+            
+            print("newly_stopped",newly_stopped)
+            print("newly_stopped shape",newly_stopped.shape)
+            
             active_sequences = active_sequences & (~newly_stopped)
+            print("active_sequences after newly stopped",active_sequences)
+            
 
             # Update input_ids for the next iteration: it's now just the newly generated tokens
             input_ids = next_token_full_batch
+            print("input_ids",input_ids)
+            print("input_ids shape",input_ids.shape)
 
             # Update attention_mask for the next iteration (append a 1 for the new token for all original sequences)
             # The attention mask needs to grow for all sequences in the batch, padding appropriately.
@@ -169,6 +200,8 @@ def test_batch_inference(
                 [attention_mask, torch.ones((batch_size, 1), device=input_ids.device)], dim=-1
             )
             
+            print("attention_mask for next iteration",attention_mask)
+            print("attention_mask for next iteration shape",attention_mask.shape)
             prof.step()
 
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))

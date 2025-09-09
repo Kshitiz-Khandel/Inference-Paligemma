@@ -123,7 +123,8 @@ class PaliGemmaConfig():
         self.vision_config = SiglipVisionConfig(**vision_config)
         self.text_config = text_config
 
-        self.text_config = GemmaConfig(**text_config, pad_token_id=pad_token_id)
+        #self.text_config = GemmaConfig(**text_config, pad_token_id=pad_token_id)
+        self.text_config = GemmaConfig(**text_config)
         self.vocab_size = self.text_config.vocab_size
 
         self.text_config.num_image_tokens = (self.vision_config.image_size // self.vision_config.patch_size) ** 2
