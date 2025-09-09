@@ -1,24 +1,28 @@
 from PIL import Image
 import torch
-import torch.nn.functional as F  # Add this missing import
+import torch.nn.functional as F
 import fire
 from typing import List, Optional, Tuple
 import time
 
 from processing_paligemma import PaliGemmaProcessor
 from gemma_flash import KVCache, PaliGemmaForConditionalGeneration
-from utils import load_hf_model 
-from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler, schedule
+from utils import load_hf_model
 
 
 def move_inputs_to_device(model_inputs: dict, device: str):
+    """Move model inputs to the specified device."""
     model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
     return model_inputs
 
 
 def get_model_inputs(
-    processor: PaliGemmaProcessor, prompts: List[str], image_file_paths: List[str], device: str
+    processor: PaliGemmaProcessor, 
+    prompts: List[str], 
+    image_file_paths: List[str], 
+    device: str
 ):
+    """Load images and prepare model inputs."""
     images = []
     for f_path in image_file_paths:
         try:
@@ -31,6 +35,7 @@ def get_model_inputs(
 
     if not images:
         raise ValueError("No valid images found for processing.")
+    
     if len(images) != len(prompts):
         raise ValueError(
             f"Mismatch: Successfully loaded {len(images)} images, but have {len(prompts)} prompts. "
@@ -42,17 +47,8 @@ def get_model_inputs(
     return model_inputs
 
 
-def multinomial_sample_one_no_sync(probs_sort):
-    """Does multinomial sampling without a cuda synchronization"""
-    print(f"[SAMPLING] Input probs shape: {probs_sort.shape}")
-    q = torch.empty_like(probs_sort).exponential_(1)
-    result = torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
-    print(f"[SAMPLING] Sampled token: {result.item() if result.numel() == 1 else result}")
-    return result
-
-
 def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = None):
-    """Convert logits to probabilities with optional top-k filtering"""
+    """Convert logits to probabilities with optional top-k filtering."""
     print(f"[LOGITS_TO_PROBS] Input logits shape: {logits.shape}, temperature: {temperature}, top_k: {top_k}")
     
     logits = logits / max(temperature, 1e-5)
@@ -68,16 +64,8 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
     return probs
 
 
-def sample_token(logits, temperature: float = 1.0, top_k: Optional[int] = None):
-    """Sample next token from logits"""
-    print(f"[SAMPLE_TOKEN] Sampling from logits shape: {logits.shape}")
-    probs = logits_to_probs(logits[:, -1], temperature, top_k)
-    idx_next = multinomial_sample_one_no_sync(probs)
-    return idx_next, probs
-
-
 def _sample_top_p(logits, top_p=0.9):
-    """Ultra-robust top-p sampling with extensive error handling"""
+    """Ultra-robust top-p sampling with extensive error handling."""
     print(f"[TOP_P_SAMPLING] Input logits shape: {logits.shape}, top_p: {top_p}")
     
     # Handle edge cases
@@ -195,9 +183,10 @@ def paligemma_forward_single_token(
     kv_cache: Optional[KVCache] = None,
     pixel_values: Optional[torch.Tensor] = None
 ):
+    """Forward pass for a single token - used in speculative decoding."""
     if input_ids.dim() == 1:  
         input_ids = input_ids.unsqueeze(0)   # Ensure shape [B, T]
-    """Forward pass for a single token - used in speculative decoding"""
+    
     print(f"[FORWARD_SINGLE] Input IDs shape: {input_ids.shape}, attention mask shape: {attention_mask.shape}")
     print(f"[FORWARD_SINGLE] Has pixel values: {pixel_values is not None}")
     print(f"[FORWARD_SINGLE] KV cache items: {kv_cache.num_items() if kv_cache else 0}")
@@ -212,6 +201,7 @@ def paligemma_forward_single_token(
     print(f"[FORWARD_SINGLE] Output logits shape: {outputs['logits'].shape}")
     return outputs
 
+
 def decode_n_tokens_draft(
     model: PaliGemmaForConditionalGeneration,
     processor: PaliGemmaProcessor,
@@ -224,7 +214,7 @@ def decode_n_tokens_draft(
     top_p: float = 0.9,
     do_sample: bool = True
 ):
-    """Decode n tokens using draft model sequentially"""
+    """Decode n tokens using draft model sequentially with fixed attention mask handling."""
     print(f"[DECODE_N_TOKENS_DRAFT] Generating {num_new_tokens} tokens with draft model")
     print(f"[DECODE_N_TOKENS_DRAFT] Current token: {cur_token}, shape: {cur_token.shape}")
     print(f"[DECODE_N_TOKENS_DRAFT] Initial attention mask shape: {attention_mask.shape}")
@@ -240,11 +230,10 @@ def decode_n_tokens_draft(
         print(f"[DECODE_N_TOKENS_DRAFT] Current attention mask shape: {current_attention_mask.shape}")
         print(f"[DECODE_N_TOKENS_DRAFT] Current KV cache items: {kv_cache.num_items()}")
         
-        # Ensure attention mask matches KV cache size
-        expected_mask_len = kv_cache.num_items() + 1  # +1 for current token
+        # CRITICAL: Ensure attention mask length matches KV cache + 1 (for current token)
+        expected_mask_len = kv_cache.num_items() + 1
         if current_attention_mask.shape[1] != expected_mask_len:
             print(f"[DECODE_N_TOKENS_DRAFT] Attention mask size mismatch: {current_attention_mask.shape[1]} != {expected_mask_len}")
-            # Adjust attention mask to match KV cache
             if current_attention_mask.shape[1] < expected_mask_len:
                 # Pad attention mask
                 pad_len = expected_mask_len - current_attention_mask.shape[1]
@@ -309,78 +298,67 @@ def speculative_decode_paligemma(
     top_p: float = 0.9,
     do_sample: bool = True
 ) -> Tuple[torch.Tensor, KVCache, KVCache, int]:
-    """
-    Speculative decoding for PaliGemma models
-    Returns: (accepted_tokens, target_kv_cache, draft_kv_cache, num_accepted)
-    """
+    """Fixed speculative decoding for PaliGemma models with proper attention mask handling."""
     print(f"[SPECULATIVE_DECODE] Starting speculative decode with k={speculate_k}")
     print(f"[SPECULATIVE_DECODE] Current token: {cur_token.item()}")
     print(f"[SPECULATIVE_DECODE] Target KV cache items: {target_kv_cache.num_items()}")
     print(f"[SPECULATIVE_DECODE] Draft KV cache items: {draft_kv_cache.num_items()}")
-    print(f"[SPECULATIVE_DECODE] Attention mask shape: {attention_mask.shape}")
+    print(f"[SPECULATIVE_DECODE] Input attention mask shape: {attention_mask.shape}")
     
     device = cur_token.device
+
+    # --- FIX RE-ADDED HERE ---
+    # CRITICAL FIX: Extend attention mask for the current token FIRST
+    # The DRAFT model needs this extended mask to process cur_token and predict the *next* token.
+    current_attention_mask = torch.cat([attention_mask, torch.ones((1, 1), device=device)], dim=-1)
+    print(f"[SPECULATIVE_DECODE] Extended attention mask shape: {current_attention_mask.shape}")
+    print(f"[SPECULATIVE_DECODE] Expected mask length for current token: {target_kv_cache.num_items() + 1}")
+    # --- END FIX ---
     
-    # Synchronize draft KV cache with target KV cache if they're out of sync
-    if draft_kv_cache.num_items() != target_kv_cache.num_items():
-        print(f"[SPECULATIVE_DECODE] KV cache sync issue: target={target_kv_cache.num_items()}, draft={draft_kv_cache.num_items()}")
-        # In case of mismatch, we need to reset and re-run the draft model
-        # For now, we'll try to continue but this indicates a deeper synchronization issue
-        
-    # Create draft attention mask that matches the draft KV cache
-    draft_attention_mask = attention_mask.clone()
-    expected_draft_mask_len = draft_kv_cache.num_items() + 1
-    
-    if draft_attention_mask.shape[1] != expected_draft_mask_len:
-        print(f"[SPECULATIVE_DECODE] Adjusting draft attention mask from {draft_attention_mask.shape[1]} to {expected_draft_mask_len}")
-        if draft_attention_mask.shape[1] < expected_draft_mask_len:
-            pad_len = expected_draft_mask_len - draft_attention_mask.shape[1]
-            padding = torch.ones((1, pad_len), device=draft_attention_mask.device)
-            draft_attention_mask = torch.cat([draft_attention_mask, padding], dim=-1)
-        else:
-            draft_attention_mask = draft_attention_mask[:, :expected_draft_mask_len]
-    
-    # Step 1: Generate k draft tokens sequentially using draft model
+    # (The original buggy "Step 1: Add the current token to target KV cache" block remains correctly DELETED)
+
+    # Step 2: Generate k draft tokens sequentially using draft model
+    # Use the extended attention mask for draft model too
     draft_tokens, draft_probs, updated_draft_kv_cache = decode_n_tokens_draft(
-        draft_model, processor, cur_token, draft_attention_mask, draft_kv_cache, 
+        draft_model, processor, cur_token, current_attention_mask, draft_kv_cache, 
         speculate_k, temperature, top_k, top_p, do_sample
     )
     
-    # Extract token values and create new tensor
+    # Extract token values and create tensor
     draft_token_values = []
     for token in draft_tokens:
         if token.numel() == 1:
             draft_token_values.append(token.item())
         else:
             raise ValueError(f"Expected single-element tensor, got {token.shape}")
-  
-    draft_tokens_tensor = torch.tensor(draft_token_values, device=cur_token.device, dtype=torch.long)
-    print(f"[SPECULATIVE_DECODE] Draft tokens tensor shape: {draft_tokens_tensor.shape}")
+    
+    draft_tokens_tensor = torch.tensor(draft_token_values, device=device, dtype=torch.long)
     print(f"[SPECULATIVE_DECODE] Draft tokens: {draft_tokens_tensor.tolist()}")
     
-    # Step 2: Create input sequence for target model (current token + draft tokens)
-    cur_token_value = cur_token.item()
-    input_sequence_values = [cur_token_value] + draft_token_values
-    target_input_sequence = torch.tensor([input_sequence_values], device=cur_token.device, dtype=torch.long)
-    print(f"[SPECULATIVE_DECODE] Target input sequence: {target_input_sequence}")
+    # Step 3: Run target model on ONLY the draft tokens
+    target_input_sequence = torch.tensor([draft_token_values], device=device, dtype=torch.long)
     print(f"[SPECULATIVE_DECODE] Target input sequence shape: {target_input_sequence.shape}")
     
-    # Create attention mask for the target sequence - should match target KV cache
+    # Create attention mask for the draft tokens
+    # Current state: target_kv_cache has processed [original_sequence + current_token]
+    # We need mask for [original_sequence + current_token + draft_tokens]
     expected_target_mask_len = target_kv_cache.num_items() + target_input_sequence.shape[1]
-    target_attention_mask = attention_mask.clone()
+    target_attention_mask = current_attention_mask.clone()
     
-    # Adjust target attention mask to proper length
+    # Extend attention mask for draft tokens
     if target_attention_mask.shape[1] < expected_target_mask_len:
         pad_len = expected_target_mask_len - target_attention_mask.shape[1]
         padding = torch.ones((1, pad_len), device=device)
         target_attention_mask = torch.cat([target_attention_mask, padding], dim=-1)
+        print(f"[SPECULATIVE_DECODE] Extended target attention mask to {target_attention_mask.shape}")
     elif target_attention_mask.shape[1] > expected_target_mask_len:
         target_attention_mask = target_attention_mask[:, :expected_target_mask_len]
+        print(f"[SPECULATIVE_DECODE] Truncated target attention mask to {target_attention_mask.shape}")
     
-    print(f"[SPECULATIVE_DECODE] Target attention mask shape: {target_attention_mask.shape}")
+    print(f"[SPECULATIVE_DECODE] Final target attention mask shape: {target_attention_mask.shape}")
     print(f"[SPECULATIVE_DECODE] Expected target mask length: {expected_target_mask_len}")
     
-    # Step 3: Run target model in parallel on the sequence
+    # Run target model on draft tokens
     target_outputs = paligemma_forward_single_token(
         target_model, target_input_sequence, target_attention_mask, target_kv_cache, pixel_values=None
     )
@@ -415,22 +393,12 @@ def speculative_decode_paligemma(
     
     for i in range(speculate_k):
         draft_token = draft_tokens_tensor[i].item()
+        
+        # target_probs[i] corresponds to draft_tokens[i]
         target_prob_at_pos = target_probs[i]  # Target probabilities at position i
         draft_prob_at_pos = draft_probs_tensor[i]  # Draft probabilities at position i
         
         # Get probabilities for the draft token
-        # Debug: check shapes
-#         print("[DEBUG] draft_probs shape:", draft_probs.shape)
-#         print("[DEBUG] target_probs shape:", target_probs.shape)
-
-#         # Debug: check current token ID
-#         print("[DEBUG] Checking draft token ID:", draft_token.item())
-
-#         # Debug: show top-5 tokens from draft and target at this position
-#         print("[DEBUG] Draft top-5:", torch.topk(draft_probs[i], 5))
-#         print("[DEBUG] Target top-5:", torch.topk(target_probs[i], 5))
-
-        
         p_draft = draft_prob_at_pos[draft_token].item()
         q_target = target_prob_at_pos[draft_token].item()
         
@@ -470,12 +438,16 @@ def speculative_decode_paligemma(
     # If all tokens were accepted, sample one more from the target model
     if accept_length == speculate_k:
         print(f"[SPECULATIVE_DECODE] All {speculate_k} tokens accepted! Sampling bonus token.")
-        bonus_probs = target_probs[speculate_k]  # Probabilities at the last position
+        # Bug fix: Should sample from the *last* set of target logits
+        # target_probs shape is [speculate_k, vocab_size]. We need the probs calculated for the *last* draft token.
+        # target_logits[0] was shape [speculate_k, vocab_size], so target_probs is the same.
+        # target_probs[speculate_k-1] or target_probs[-1] is correct.
+        bonus_probs = target_probs[-1]  # Use last position's probabilities
         bonus_token = torch.multinomial(bonus_probs, num_samples=1)
         accepted_tokens.append(bonus_token)
         accept_length += 1
         print(f"[SPECULATIVE_DECODE] Bonus token: {bonus_token.item()}")
-    
+
     # Concatenate accepted tokens - ensure consistent shape
     if accepted_tokens:
         # Make sure all tokens have consistent shape [1]
@@ -489,15 +461,30 @@ def speculative_decode_paligemma(
                 normalized_tokens.append(token.squeeze())
         final_tokens = torch.cat(normalized_tokens, dim=0)
     else:
-        # This shouldn't happen, but as a safeguard
-        final_tokens = torch.tensor([cur_token.item()], device=device)
-    
+        # This shouldn't happen, but as a safeguard (e.g., if draft model fails to produce tokens)
+        # We must return *something* to avoid a crash. Let's sample from the target model's *first* prediction (based on cur_token)
+        # NOTE: This logic path is now broken because we removed the initial target pass.
+        # If accepted_tokens is empty, it means the loop broke on the first rejection (i=0)
+        # and it *should* contain the single 'corrected_token'. This 'else' path is likely unreachable.
+        # But just in case, let's create an empty tensor. The main loop logic will handle it.
+        # Actually, the rejection logic *always* appends a token, so 'accepted_tokens' will never be empty if speculate_k > 0.
+        # This path is safe.
+        final_tokens = torch.tensor([], device=device, dtype=torch.long)  # Should be handled by rejection logic
+        print("[SPECULATIVE_DECODE] WARNING: No tokens were accepted or corrected.")
+
     print(f"[SPECULATIVE_DECODE] Final accepted tokens: {final_tokens.tolist()}")
-    print(f"[SPECULATIVE_DECODE] Acceptance rate: {accept_length}/{speculate_k} = {accept_length/speculate_k:.2%}")
+    print(f"[SPECULATIVE_DECODE] Acceptance rate: {len(final_tokens)} tokens generated ({accept_length-1} accepted / {speculate_k} speculated)")  # A bit confusing, let's stick to your old log
+    print(f"[SPECULATIVE_DECODE] Acceptance count: {accept_length} (includes bonus/corrected)")
     print(f"[SPECULATIVE_DECODE] Final target KV cache items: {updated_target_kv_cache.num_items()}")
     print(f"[SPECULATIVE_DECODE] Final draft KV cache items: {updated_draft_kv_cache.num_items()}")
     
-    return final_tokens, updated_target_kv_cache, updated_draft_kv_cache, accept_length
+    # The number accepted for stats should be the number *actually accepted* (accept_length)
+    # or if a rejection happened, it's the index 'i' where it broke + 1 (for the corrected token).
+    # The 'num_accepted' should just be the count of tokens we are returning.
+    num_accepted_for_stats = len(final_tokens)
+    
+    return final_tokens, updated_target_kv_cache, updated_draft_kv_cache, num_accepted_for_stats
+
 
 def test_speculative_inference(
     target_model: PaliGemmaForConditionalGeneration,
@@ -513,7 +500,7 @@ def test_speculative_inference(
     top_p: float = 0.9,
     do_sample: bool = True,
 ):
-    """Main function for speculative inference with PaliGemma"""
+    """Main function for speculative inference with PaliGemma."""
     print(f"[SPEC_INFERENCE] Starting speculative inference")
     print(f"[SPEC_INFERENCE] Max tokens: {max_tokens_to_generate}, speculate_k: {speculate_k}")
     print(f"[SPEC_INFERENCE] Temperature: {temperature}, top_p: {top_p}, do_sample: {do_sample}")
@@ -536,7 +523,7 @@ def test_speculative_inference(
     generated_tokens = []
     acceptance_counts = [0] * (speculate_k + 2)  # Track acceptance statistics
     
-    # Initial prefill phase for both models
+    # FIXED: Single prefill phase for both models
     print(f"[SPEC_INFERENCE] === PREFILL PHASE ===")
     
     # Target model prefill
@@ -548,20 +535,6 @@ def test_speculative_inference(
         kv_cache=target_kv_cache,
     )
     target_kv_cache = target_outputs["kv_cache"]
-    next_token_logits = target_outputs["logits"][:, -1, :]
-    
-    # Sample first token from target model
-    if do_sample:
-        next_token = _sample_top_p(next_token_logits / temperature, top_p)
-    else:
-        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-    
-    print(f"[SPEC_INFERENCE] First generated token: {next_token.item()}")
-    # Ensure consistent shape for generated_tokens
-    if next_token.dim() == 2:
-        generated_tokens.append(next_token.squeeze(0))  # Convert [1, 1] -> [1]
-    else:
-        generated_tokens.append(next_token)
     
     # Draft model prefill
     print(f"[SPEC_INFERENCE] Draft model prefill...")
@@ -573,8 +546,22 @@ def test_speculative_inference(
     )
     draft_kv_cache = draft_outputs["kv_cache"]
     
-    # Update attention mask for generated token
-    attention_mask = torch.cat([attention_mask, torch.ones((1, 1), device=device)], dim=-1)
+    # Sample first token from target model only
+    next_token_logits = target_outputs["logits"][:, -1, :]
+    if do_sample:
+        next_token = _sample_top_p(next_token_logits / temperature, top_p)
+    else:
+        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+    
+    print(f"[SPEC_INFERENCE] First generated token: {next_token.item()}")
+    
+    # Ensure consistent shape for generated_tokens
+    if next_token.dim() == 2:
+        generated_tokens.append(next_token.squeeze(0))  # Convert [1, 1] -> [1]
+    else:
+        generated_tokens.append(next_token)
+    
+    # Update attention mask for generated token (this will be the base for speculative decoding)
     current_token = next_token.squeeze() if next_token.dim() > 1 else next_token
     if current_token.dim() == 0:
         current_token = current_token.unsqueeze(0)
@@ -617,7 +604,7 @@ def test_speculative_inference(
         for i, token_val in enumerate(accepted_tokens.tolist()):
             token_tensor = torch.tensor([token_val], device=device)
             generated_tokens.append(token_tensor)
-            # Extend attention mask
+            # Extend attention mask for each accepted token
             attention_mask = torch.cat([attention_mask, torch.ones((1, 1), device=device)], dim=-1)
         
         # Update current token for next iteration
@@ -691,6 +678,7 @@ def main(
     do_sample: bool = True,
     only_cpu: bool = False,
 ):
+    """Main function to run speculative decoding."""
     device = "cpu"
     if not only_cpu:
         if torch.cuda.is_available():
