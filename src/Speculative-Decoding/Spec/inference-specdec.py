@@ -1,3 +1,4 @@
+## inference with speculative decoding
 from PIL import Image
 import torch
 import torch.nn.functional as F
@@ -434,6 +435,12 @@ def speculative_decode_paligemma(
             
             accepted_tokens.append(corrected_token)
             break
+            
+##uncomment above for corrrect fix            
+            
+            
+  
+   
     
     # If all tokens were accepted, sample one more from the target model
     if accept_length == speculate_k:
@@ -679,6 +686,8 @@ def main(
     only_cpu: bool = False,
 ):
     """Main function to run speculative decoding."""
+    print("Set manual seed")
+    torch.manual_seed(42) 
     device = "cpu"
     if not only_cpu:
         if torch.cuda.is_available():

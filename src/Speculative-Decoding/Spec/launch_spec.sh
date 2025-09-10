@@ -22,16 +22,17 @@
 
 
 MODEL_PATH="/home/jupyter/Paligemma/google/paligemma-3b-pt-896"  
-DRAFT_MODEL_PATH="/home/jupyter/Paligemma/google/draft/"  
+DRAFT_MODEL_PATH="/home/jupyter/Paligemma/google/draft_distilled_ddp"
+#"/home/jupyter/Paligemma/google/draft/16"  
 
-PROMPT="the dog is?"
+PROMPT="the building is "
 
 # Pass multiple --image_file_path arguments
-python inference-specdec.py \
+python Copy-inference-specdec.py \
     --target_model_path "$MODEL_PATH" \
     --draft_model_path "$DRAFT_MODEL_PATH" \
     --prompt "$PROMPT" \
-    --image_file_path /home/jupyter/Inference-Paligemma/Images/dog.jpeg \
+    --image_file_path /home/jupyter/Inference-Paligemma/Images/building.jpeg \
     --max_tokens_to_generate 100 \
     --temperature 0.8 \
     --top_p 0.9 \
