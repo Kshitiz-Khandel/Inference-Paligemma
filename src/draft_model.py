@@ -367,9 +367,9 @@ def main(
             
         # Suggest alternatives
         if no_fixes:
-            logger.info(" Try running with --apply_fixes=True for better results")
+            logger.info("Try running with --apply_fixes=True for better results")
         elif apply_fixes:
-            logger.info(" Try running with --no_fixes=True for a pure early exit approach")
+            logger.info("Try running with --no_fixes=True for a pure early exit approach")
         
         logger.info(f" Consider trying fewer layers (current: {target_num_layers})")
 
