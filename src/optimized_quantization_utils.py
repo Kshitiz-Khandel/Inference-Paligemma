@@ -1,5 +1,5 @@
 """
-Fixed quantization module with corrected shape handling.
+ quantization module.
 """
 
 import torch
