@@ -1,3 +1,4 @@
+## Gemma flash script
 import torch
 from torch import nn
 from typing import Optional, Tuple, List
@@ -46,6 +47,40 @@ class KVCache():
 
         # ... and then we return all the existing keys + the new ones.
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
+    
+    
+    def rollback(self, num_tokens_to_remove: int):
+        """
+        Remove the last num_tokens_to_remove tokens from the KV cache.
+        Critical for speculative decoding when draft tokens are rejected.
+        """
+        if num_tokens_to_remove <= 0:
+            return
+        
+        print(f"[KV_CACHE] Rolling back {num_tokens_to_remove} tokens")
+        print(f"[KV_CACHE] Current cache size: {self.num_items()}")
+        
+        for layer_idx in range(len(self.key_cache)):
+            current_seq_len = self.key_cache[layer_idx].shape[-2]
+            new_seq_len = max(0, current_seq_len - num_tokens_to_remove)
+            
+            # Truncate the cache tensors
+            self.key_cache[layer_idx] = self.key_cache[layer_idx][:, :, :new_seq_len, :]
+            self.value_cache[layer_idx] = self.value_cache[layer_idx][:, :, :new_seq_len, :]
+        
+        print(f"[KV_CACHE] After rollback cache size: {self.num_items()}")
+
+    def copy(self):
+        """Create a deep copy of the KV cache for backup purposes."""
+        new_cache = KVCache()
+        new_cache.key_cache = [tensor.clone() for tensor in self.key_cache]
+        new_cache.value_cache = [tensor.clone() for tensor in self.value_cache]
+        return new_cache
+
+    def restore_from(self, other_cache):
+        """Restore this cache from another cache (for rollback to specific state)."""
+        self.key_cache = [tensor.clone() for tensor in other_cache.key_cache]
+        self.value_cache = [tensor.clone() for tensor in other_cache.value_cache]
 
 
 class AttentionType(enum.Enum):
@@ -291,7 +326,7 @@ class GemmaAttention(nn.Module):
         )
         
         if use_flash_attn:
-            print(f"Layer {self.layer_idx}: Using Flash Attention (Prefill)")
+            #print(f"Layer {self.layer_idx}: Using Flash Attention (Prefill)")
             q_flash = query_states.transpose(1, 2)
             k_flash = key_states.transpose(1, 2)
             v_flash = value_states.transpose(1, 2)
@@ -304,7 +339,7 @@ class GemmaAttention(nn.Module):
             )
             
         else:
-            print(f"Layer {self.layer_idx}: Using SDPA ({'Decode' if is_decode_phase else 'Prefill'})")
+            #print(f"Layer {self.layer_idx}: Using SDPA ({'Decode' if is_decode_phase else 'Prefill'})")
             attn_output = F.scaled_dot_product_attention(
                 query=query_states,
                 key=key_states,
