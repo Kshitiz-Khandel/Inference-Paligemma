@@ -31,56 +31,19 @@
 
    ```
 
-## Inference
+## Speculative decoding
 
 ```bash
-./launch_inference.sh
+python draft_model.py \
+  --target_model_path "/home/jupyter/Paligemma/google/paligemma-3b-pt-896" \
+  --draft_save_path "/home/jupyter/Paligemma/draft/draft_model_9" \
+  --target_num_layers 9 \
+  --apply_fixes True \
+  --diagnose_only False \
+  --device "cuda"
 ```
 
-### Configuration
 
-You can modify the `launch_inference.sh` script to customize the inference parameters:
-
-```bash
-#!/bin/bash
-
-#Path to model weights
-MODEL_PATH="/home/jupyter/Paligemma/google/paligemma-3b-pt-896"  
-
-#Text prompt for the model
-PROMPT="the dog is ,the building is ,the mountain is "   
-
-#Comma-separated list of image file paths (must match number of prompts)
-IMAGE_FILE_PATH="/home/jupyter/Paligemma2/images/dog.jpeg,/home/jupyter/Paligemma2/images/building.jpeg,/home/jupyter/Paligemma2/images/mountains.jpeg"  
-
-# Maximum response length
-MAX_TOKENS_TO_GENERATE=100 
-
-# Temperature for sampling
-TEMPERATURE=0.8
-
-# Top-p sampling parameter
-TOP_P=0.9
-
-# Whether to use Greedy decoding or Top P
-DO_SAMPLE="False"
-
-# Whether to use CPU only
-ONLY_CPU="False"
-
-
-
-
-python inference.py \
-    --model_path "$MODEL_PATH" \
-    --prompt "$PROMPT" \
-    --image_file_path "$IMAGE_FILE_PATH" \
-    --max_tokens_to_generate $MAX_TOKENS_TO_GENERATE \
-    --temperature $TEMPERATURE \
-    --top_p $TOP_P \
-    --do_sample $DO_SAMPLE \
-    --only_cpu $ONLY_CPU \
-```
 
 ## Citation
 
