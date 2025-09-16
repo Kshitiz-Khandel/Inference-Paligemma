@@ -31,7 +31,7 @@
 
    ```
 
-## Speculative decoding
+## Speculative decoding(Create draft model)
 
 ```bash
 python draft_model.py \
@@ -41,8 +41,16 @@ python draft_model.py \
   --apply_fixes True \
   --diagnose_only False \
   --device "cuda"
+
+
 ```
 
+## Launch inferencing
+
+```bash
+./launch_spec.sh
+  
+```
 
 
 ## Citation
