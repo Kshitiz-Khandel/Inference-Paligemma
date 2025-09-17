@@ -36,8 +36,8 @@
 ```bash
 python draft_model.py \
   --target_model_path "/home/jupyter/Paligemma/google/paligemma-3b-pt-896" \
-  --draft_save_path "/home/jupyter/Paligemma/draft/draft_model_9" \
-  --target_num_layers 9 \
+  --draft_save_path "/home/jupyter/Paligemma/draft/draft_model_10" \
+  --target_num_layers 10 \
   --apply_fixes True \
   --diagnose_only False \
   --device "cuda"
@@ -48,7 +48,7 @@ python draft_model.py \
 ## Launch inferencing
 
 ```bash
-./launch_spec.sh
+./launch_inference.sh
   
 ```
 

@@ -1,23 +1,17 @@
-
 MODEL_PATH="/home/jupyter/Paligemma/google/paligemma-3b-pt-896"  
+DRAFT_MODEL_PATH="/home/jupyter/Paligemma/draft/draft_model_10"
 
-PROMPT="the dog is ,the building is ,the mountain is "
+PROMPT="the building is "
 
-# Comma-separated list of image file paths (must match number of prompts)
-IMAGE_FILE_PATH="/home/jupyter/Inference-Paligemma/Images/dog.jpeg,/home/jupyter/Inference-Paligemma/Images/building.jpeg,/home/jupyter/Inference-Paligemma/Images/mountains.jpeg"
-
-MAX_TOKENS_TO_GENERATE=100
-TEMPERATURE=0.8
-TOP_P=0.9
-DO_SAMPLE="False"
-ONLY_CPU="False"
-
+# Pass multiple --image_file_path arguments
 python inference.py \
-    --model_path "$MODEL_PATH" \
-    --prompts "$PROMPT" \
-    --image_file_paths "$IMAGE_FILE_PATH" \
-    --max_tokens_to_generate $MAX_TOKENS_TO_GENERATE \
-    --temperature $TEMPERATURE \
-    --top_p $TOP_P \
-    --do_sample $DO_SAMPLE \
-    --only_cpu $ONLY_CPU \
+    --target_model_path "$MODEL_PATH" \
+    --draft_model_path "$DRAFT_MODEL_PATH" \
+    --prompt "$PROMPT" \
+    --image_file_path /home/jupyter/Inference-Paligemma/Images/building.jpeg \
+    --max_tokens_to_generate 100 \
+    --temperature 0.8 \
+    --top_p 0.9 \
+    --do_sample True \
+    --only_cpu False \
+    --speculate_k 4
